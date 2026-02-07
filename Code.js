@@ -75,6 +75,14 @@ const CONFIG = {
  ***********************/
 function checkMailAndCreateTwoEvents() {
   const runId = newRunId_();
+  const lock = LockService.getScriptLock();
+  const lockAcquired = lock.tryLock(5000);
+
+  if (!lockAcquired) {
+    slogErr_(runId, "LOCK_BUSY", "Пропуск запуска: предыдущий запуск ещё выполняется", {});
+    sheetLog_(runId, CONFIG.TEST_MODE ? "TEST" : "LIVE", "LOCK_BUSY", "Пропуск: активен предыдущий запуск", {});
+    return;
+  }
 
   slogInfo_(runId, "START", "Запуск", {
     testMode: CONFIG.TEST_MODE,
@@ -180,6 +188,8 @@ function checkMailAndCreateTwoEvents() {
     slogErr_(runId, "FATAL", "Фатальная ошибка", payload);
     sheetLog_(runId, CONFIG.TEST_MODE ? "TEST" : "LIVE", "ERR_FATAL", "Фатальная ошибка", payload);
     throw err;
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -191,6 +201,17 @@ function setupTriggerEveryMinute() {
     .timeBased()
     .everyMinutes(1)
     .create();
+}
+
+function setupSingleTriggerEveryMinute() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "checkMailAndCreateTwoEvents") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+
+  setupTriggerEveryMinute();
 }
 
 /***********************

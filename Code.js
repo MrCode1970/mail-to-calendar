@@ -1,16 +1,17 @@
 /*************************************************************
- * PROJECT: Mail → Calendar “НЕ ПРОЗЕВАТЬ”
+ * PROJECT: Mail → Calendar V3
  *
  * Цель:
  *  - ждать письмо от queue-mailer@kdmid.ru (действительно 24 часа)
  *  - создать в Google Calendar события, чтобы сложно было пропустить уведомления
  *
- * Модель: 2 события
+ * Модель: 4 вида событий
  *  1) ALLDAY (сегодня) — визуальный якорь “как ДР”
- *  2) TAIL (боевое) — “пищит”, стартует скоро (now+2мин, округление до 5 минут),
- *     но если попало в тихий интервал 23:00–07:00 → старт 07:00.
- *     end = receivedAt + 24 часа.
- *     reminders: 0, +2ч, +4ч, +6ч, +8ч.
+ *  2) LONG (сутки) — старт now+10мин, конец receivedAt+24ч,
+ *     напоминания за 8/6/4/2 минут и в момент старта
+ *  3) HOURLY-CHAIN — часовые сигналы вне тихого времени
+ *     (создаётся/проверяется цепочкой, прекращается при удалении)
+ *  4) FINAL — финальное событие перед дедлайном
  *
  * Режимы:
  *  - LIVE: берём новые письма from:sender -label:processed newer_than:2d
@@ -41,12 +42,20 @@ const CONFIG = {
   // “Письмо действительно” (часов)
   ACTIVE_WINDOW_HOURS: 24,
 
-  // Напоминания для tail-события (минуты от НАЧАЛА tail)
-  TAIL_REMINDERS_MINUTES: [0, 120, 240, 360, 480],
+  // LONG: старт now + 10 минут
+  EVENT1_START_PLUS_MINUTES: 10,
 
-  // Tail start: now + 2 минуты, округление вверх до 5 минут
-  TAIL_START_PLUS_MINUTES: 2,
-  TAIL_START_ROUND_MINUTES: 5,
+  // LONG: напоминания в минутах до старта
+  EVENT1_REMINDERS_MINUTES: [8, 6, 4, 2, 0],
+
+  // HOURLY-CHAIN: шаг сигналов (часы)
+  HOURLY_INTERVAL_HOURS: 1,
+
+  // HOURLY-CHAIN: максимум сигналов в одном событии
+  HOURLY_BLOCK_MAX_SIGNALS: 5,
+
+  // FINAL: напоминания в минутах до старта
+  FINAL_REMINDERS_MINUTES: [40, 30, 20, 10, 0],
 
   // Тихий интервал (по Израилю — timezone скрипта/аккаунта)
   QUIET_HOUR_START: 23, // 23:00
@@ -156,7 +165,7 @@ function checkMailAndCreateTwoEvents() {
 
       const receivedAt = message.getDate();
       const subject = message.getSubject();
-      const gmailLink = "https://mail.google.com/mail/u/0/#inbox/" + threadId;
+      const gmailLink = buildGmailThreadLink_(threadId);
 
       slogBrief_(runId, "THREAD", `threadId=${threadId} receivedAt=${receivedAt.toISOString()} subj="${truncate_(subject, 60)}"`);
 
@@ -166,7 +175,7 @@ function checkMailAndCreateTwoEvents() {
         subject,
         threadId,
         gmailLink,
-        meta: {}
+        meta: { gmailMessageLink: buildGmailMessageLink_(message) }
       };
 
       createTwoEventsForMail_(runId, mail);
@@ -328,7 +337,7 @@ function deleteAllTestAlerts_Legacy() {
 }
 
 /***********************
- * CORE: CREATE 2 EVENTS
+ * CORE: CREATE EVENTS
  ***********************/
 function createTwoEventsForMail_(runId, mail) {
   const mode = mail.mode || "LIVE";
@@ -341,9 +350,8 @@ function createTwoEventsForMail_(runId, mail) {
   const todayStart = startOfDay_(receivedAt);
   const tomorrowStart = addDays_(todayStart, 1);
 
-  // TAIL — старт “скоро” от текущего now (а не от receivedAt), чтобы пищало сразу после запуска
   const now = new Date();
-  const tailStartCandidate = computeTailStart_(now);
+  const longStart = addMinutes_(now, CONFIG.EVENT1_START_PLUS_MINUTES);
 
   const cal = CalendarApp.getDefaultCalendar();
 
@@ -359,7 +367,7 @@ function createTwoEventsForMail_(runId, mail) {
     receivedAt: receivedAt.toString(),
     expiresAt: expiresAt.toString(),
     now: now.toString(),
-    tailStartCandidate: tailStartCandidate.toString(),
+    longStart: longStart.toString(),
     quiet: { startHour: CONFIG.QUIET_HOUR_START, endHour: CONFIG.QUIET_HOUR_END, setToHour: CONFIG.QUIET_SET_TO_HOUR },
     meta: mail.meta || {}
   });
@@ -400,33 +408,15 @@ function createTwoEventsForMail_(runId, mail) {
   }
 
   // -------------------------
-  // EVENT 2: TAIL
+  // EVENT 2: LONG (24h)
   // -------------------------
-  const tailStart = tailStartCandidate;
-  const tailEnd = expiresAt;
+  const longId = baseId + "|LONG";
+  const longTitle = prefix + " 🔔 Сутки: " + truncate_(mail.subject || "(без темы)", 55);
 
-  if (tailEnd.getTime() <= tailStart.getTime()) {
-    slogOk_(runId, "TAIL_SKIP", "TAIL не нужен: expiresAt <= tailStart", {
-      tailStart: tailStart.toString(),
-      tailEnd: tailEnd.toString()
-    });
-
-    sheetLog_(runId, mode, "ALERTS_CREATED", "Создано: ALLDAY, TAIL=SKIP", {
-      baseId, allDayId,
-      receivedAt: receivedAt.toISOString(),
-      expiresAt: expiresAt.toISOString(),
-      tailStart: tailStart.toISOString()
-    });
-    return;
-  }
-
-  const tailId = baseId + "|TAIL";
-  const tailTitle = prefix + " 🔔 Пищит: до " + formatHHMM_(tailEnd) + " — " + truncate_(mail.subject || "(без темы)", 55);
-
-  const tailDescription = buildDescriptionNew_({
-    id: tailId,
+  const longDescription = buildDescriptionNew_({
+    id: longId,
     mode,
-    kind: "TAIL",
+    kind: "LONG",
     expectedSender: CONFIG.EXPECTED_SENDER_EMAIL,
     inbox: CONFIG.YOUR_INBOX_EMAIL,
     subject: mail.subject || "",
@@ -434,42 +424,40 @@ function createTwoEventsForMail_(runId, mail) {
     expiresAt,
     gmailLink: mail.gmailLink || "",
     threadId: mail.threadId || "",
-    tailStart: tailStart.toString(),
-    reminders: CONFIG.TAIL_REMINDERS_MINUTES.join(", "),
-    meta: mail.meta || {}
+    reminders: CONFIG.EVENT1_REMINDERS_MINUTES.join(", "),
+    meta: Object.assign({}, mail.meta || {}, { longStart: longStart.toISOString() })
   });
 
-  // ВАЖНО: при поиске TAIL игнорируем all-day
-  const tailExists = findEventById_(cal, tailStart, tailEnd, tailId, { allowAllDay: false });
-
-  if (tailExists) {
-    slogOk_(runId, "TAIL_EXISTS", "TAIL уже есть (по ID)", { title: tailExists.getTitle(), id: tailId });
+  const longExists = findEventById_(cal, addMinutes_(longStart, -60), addMinutes_(expiresAt, 60), longId, { allowAllDay: false });
+  if (longExists) {
+    slogOk_(runId, "LONG_EXISTS", "LONG уже есть (по ID)", { title: longExists.getTitle(), id: longId });
   } else {
-    const ev2 = cal.createEvent(tailTitle, tailStart, tailEnd, { description: tailDescription });
-    ev2.removeAllReminders();
-    for (let i = 0; i < CONFIG.TAIL_REMINDERS_MINUTES.length; i++) {
-      ev2.addPopupReminder(CONFIG.TAIL_REMINDERS_MINUTES[i]);
+    const evLong = cal.createEvent(longTitle, longStart, expiresAt, { description: longDescription });
+    evLong.removeAllReminders();
+    for (let i = 0; i < CONFIG.EVENT1_REMINDERS_MINUTES.length; i++) {
+      evLong.addPopupReminder(CONFIG.EVENT1_REMINDERS_MINUTES[i]);
     }
-    slogOk_(runId, "TAIL_CREATED", "Создан TAIL + reminders", {
-      title: tailTitle,
-      id: tailId,
-      tailStart: tailStart.toString(),
-      tailEnd: tailEnd.toString(),
-      remindersMinutes: CONFIG.TAIL_REMINDERS_MINUTES
+    slogOk_(runId, "LONG_CREATED", "Создано LONG (24h)", {
+      title: longTitle,
+      id: longId,
+      longStart: longStart.toString(),
+      expiresAt: expiresAt.toString(),
+      remindersMinutes: CONFIG.EVENT1_REMINDERS_MINUTES
     });
   }
 
-  sheetLog_(runId, mode, "ALERTS_CREATED", "Созданы/проверены 2 события", {
+  // -------------------------
+  // EVENT 3: HOURLY CHAIN + FINAL
+  // -------------------------
+  startHourlyChainForMail_(runId, mail, baseId, longStart, expiresAt);
+
+  sheetLog_(runId, mode, "ALERTS_CREATED", "Созданы: ALLDAY + LONG + CHAIN", {
     baseId,
     allDayId,
-    tailId,
+    longId,
     receivedAt: receivedAt.toISOString(),
-    expiresAt: expiresAt.toISOString(),
-    tailStart: tailStart.toISOString(),
-    tailEnd: tailEnd.toISOString(),
-    subject: mail.subject || "",
-    threadId: mail.threadId || "",
-    meta: mail.meta || {}
+    longStart: longStart.toISOString(),
+    expiresAt: expiresAt.toISOString()
   });
 }
 
@@ -501,7 +489,8 @@ function findLatestMailFromSender_(runId, senderEmail, lookbackDays) {
           subject: msg.getSubject(),
           realReceivedAt: d,
           messageId: msg.getId(),
-          gmailLink: "https://mail.google.com/mail/u/0/#inbox/" + threadId
+          gmailLink: buildGmailThreadLink_(threadId),
+          gmailMessageLink: buildGmailMessageLink_(msg)
         };
       }
     }
@@ -555,26 +544,17 @@ function extractLineValue_(desc, key) {
   return m ? (m[1] || "").trim() : "";
 }
 
-/***********************
- * TAIL START CALC
- ***********************/
-function computeTailStart_(now) {
-  const plusMs = CONFIG.TAIL_START_PLUS_MINUTES * 60 * 1000;
-  const d = new Date(now.getTime() + plusMs);
-
-  const rounded = ceilToMinutes_(d, CONFIG.TAIL_START_ROUND_MINUTES);
-
-  if (isInQuietHours_(rounded)) {
-    return nextQuietEndToMorning_(rounded);
-  }
-  return rounded;
-}
-
+// Округление вверх до заданного шага минут
 function ceilToMinutes_(dt, stepMinutes) {
   const ms = dt.getTime();
   const stepMs = stepMinutes * 60 * 1000;
   const roundedMs = Math.ceil(ms / stepMs) * stepMs;
   return new Date(roundedMs);
+}
+
+function ceilToHour_(dt) {
+  const rounded = ceilToMinutes_(dt, 60);
+  return rounded;
 }
 
 function isInQuietHours_(dt) {
@@ -591,12 +571,6 @@ function nextQuietEndToMorning_(dt) {
   }
   res.setHours(CONFIG.QUIET_SET_TO_HOUR, 0, 0, 0);
   return res;
-}
-
-function formatHHMM_(dt) {
-  const hh = String(dt.getHours()).padStart(2, "0");
-  const mm = String(dt.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
 }
 
 /***********************
@@ -632,6 +606,12 @@ function buildDescriptionNew_(p) {
     metaBlock = "";
   }
 
+  const messageLink = (p.meta && p.meta.gmailMessageLink) ? String(p.meta.gmailMessageLink) : "";
+  const openMailBlock = messageLink
+    ? ("\nOpen mail (thread):\n" + (p.gmailLink || "") + "\n\n" +
+       "Open mail (message):\n" + messageLink + "\n\n")
+    : ("\nOpen mail:\n" + (p.gmailLink || "") + "\n\n");
+
   return (
     "MAILALERT_ID: " + p.id + "\n" +
     "MAILALERT_MODE: " + p.mode + "\n" +
@@ -645,7 +625,7 @@ function buildDescriptionNew_(p) {
     (p.tailStart ? ("TailStart: " + p.tailStart + "\n") : "") +
     (p.reminders ? ("Reminders (min): " + p.reminders + "\n") : "") +
     metaBlock +
-    "\nOpen mail:\n" + (p.gmailLink || "") + "\n\n" +
+    openMailBlock +
     "Удалишь событие — значит письмо обработано."
   );
 }
@@ -653,26 +633,52 @@ function buildDescriptionNew_(p) {
 /***********************
  * SHEETS LOG
  ***********************/
-function getOrCreateLogSheet_() {
-  let ss;
-  const files = DriveApp.getFilesByName(CONFIG.LOG_SPREADSHEET_NAME);
-  if (files.hasNext()) ss = SpreadsheetApp.open(files.next());
-  else ss = SpreadsheetApp.create(CONFIG.LOG_SPREADSHEET_NAME);
+function withRetries_(label, fn, opts) {
+  const attempts = opts && opts.attempts ? opts.attempts : 3;
+  const baseDelayMs = opts && opts.baseDelayMs ? opts.baseDelayMs : 500;
+  let lastErr = null;
 
-  let sheet = ss.getSheetByName(CONFIG.LOG_SHEET_NAME);
-  if (!sheet) sheet = ss.insertSheet(CONFIG.LOG_SHEET_NAME);
-
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(["Timestamp", "RunId", "Mode", "Status", "Message", "JSON"]);
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastErr = err;
+      console.error(`[retry] ${label} failed (attempt ${i + 1}/${attempts}): ${err}`);
+      if (i < attempts - 1) {
+        Utilities.sleep(baseDelayMs * Math.pow(2, i));
+      }
+    }
   }
-  return sheet;
+  throw lastErr;
+}
+
+function getOrCreateLogSheet_() {
+  return withRetries_("getOrCreateLogSheet_", function () {
+    let ss;
+    const files = DriveApp.getFilesByName(CONFIG.LOG_SPREADSHEET_NAME);
+    if (files.hasNext()) ss = SpreadsheetApp.open(files.next());
+    else ss = SpreadsheetApp.create(CONFIG.LOG_SPREADSHEET_NAME);
+
+    let sheet = ss.getSheetByName(CONFIG.LOG_SHEET_NAME);
+    if (!sheet) sheet = ss.insertSheet(CONFIG.LOG_SHEET_NAME);
+
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow(["Timestamp", "RunId", "Mode", "Status", "Message", "JSON"]);
+    }
+    return sheet;
+  });
 }
 
 function sheetLog_(runId, mode, status, message, obj) {
-  const sheet = getOrCreateLogSheet_();
-  let json = "";
-  try { json = JSON.stringify(obj || {}); } catch (e) { json = String(obj); }
-  sheet.appendRow([new Date(), runId, mode, status, message, json]);
+  try {
+    const sheet = getOrCreateLogSheet_();
+    let json = "";
+    try { json = JSON.stringify(obj || {}); } catch (e) { json = String(obj); }
+    const row = [new Date(), runId, mode, status, message, json];
+    withRetries_("sheet.appendRow", function () { sheet.appendRow(row); });
+  } catch (err) {
+    console.error(`[${runId}] ERR SHEET_LOG: ${err}`);
+  }
 }
 
 function setupConditionalFormatting_(sheet) {
@@ -757,6 +763,319 @@ function getOrCreateGmailLabel_(labelName) {
   return label;
 }
 
+function buildGmailThreadLink_(threadId) {
+  if (threadId) return "https://mail.google.com/mail/u/0/#inbox/" + threadId;
+  return "https://mail.google.com/mail/u/0/#inbox";
+}
+
+function buildGmailMessageLink_(message) {
+  try {
+    const header = message.getHeader("Message-ID");
+    if (header) {
+      const clean = String(header).replace(/[<>]/g, "");
+      return "https://mail.google.com/mail/u/0/#search/rfc822msgid:" + encodeURIComponent(clean);
+    }
+  } catch (e) {}
+
+  try {
+    const id = message.getId();
+    if (id) return "https://mail.google.com/mail/u/0/#inbox/" + id;
+  } catch (e) {}
+
+  return "https://mail.google.com/mail/u/0/#inbox";
+}
+
+/***********************
+ * CHAIN: HOURLY EVENTS
+ ***********************/
+function startHourlyChainForMail_(runId, mail, baseId, longStart, expiresAt) {
+  const chainId = baseId + "|HCHAIN";
+
+  if (getHourlyChainState_(chainId)) {
+    slogOk_(runId, "HCHAIN_EXISTS", "HOURLY-CHAIN уже запущена", { chainId });
+    return;
+  }
+
+  const signals = buildHourlySignals_(longStart, expiresAt);
+  if (!signals.length) {
+    slogOk_(runId, "HCHAIN_SKIP", "HOURLY-CHAIN не нужна: нет сигналов", {});
+    return;
+  }
+
+  const blocks = buildHourlyBlocks_(signals);
+  if (!blocks.length) {
+    slogOk_(runId, "HCHAIN_SKIP", "HOURLY-CHAIN не нужна: нет блоков", {});
+    return;
+  }
+
+  const first = blocks[0];
+  const ctx = {
+    mode: mail.mode || "LIVE",
+    subject: mail.subject || "",
+    threadId: mail.threadId || "",
+    gmailLink: mail.gmailLink || "",
+    meta: mail.meta || {},
+    receivedAt: mail.receivedAt,
+    expiresAt: expiresAt.toISOString()
+  };
+  const eventId = createHourlyBlockEvent_(ctx, chainId, 0, first);
+
+  const state = {
+    chainId,
+    baseId,
+    mode: mail.mode || "LIVE",
+    subject: mail.subject || "",
+    threadId: mail.threadId || "",
+    gmailLink: mail.gmailLink || "",
+    meta: mail.meta || {},
+    receivedAt: mail.receivedAt.toISOString(),
+    longStart: longStart.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    blocks,
+    indexCurrent: 0,
+    currentEventId: eventId,
+    pendingDeleteEventId: "",
+    status: "active"
+  };
+
+  saveHourlyChainState_(state);
+  ensureHourlyChainTrigger_();
+
+  slogOk_(runId, "HCHAIN_STARTED", "HOURLY-CHAIN: создан первый блок", {
+    chainId,
+    eventId,
+    start: first.start
+  });
+}
+
+function processHourlyChains_() {
+  const now = new Date();
+  const cal = CalendarApp.getDefaultCalendar();
+  const chains = listHourlyChainStates_();
+  if (!chains.length) {
+    cleanupHourlyChainTrigger_();
+    return;
+  }
+
+  for (let i = 0; i < chains.length; i++) {
+    const st = chains[i];
+
+    if (st.pendingDeleteEventId) {
+      const pending = findEventById_(cal, addHours_(now, -48), addHours_(now, 48), st.pendingDeleteEventId, { allowAllDay: false });
+      if (pending) pending.deleteEvent();
+      st.pendingDeleteEventId = "";
+    }
+
+    if (st.status === "final_cleanup") {
+      deleteHourlyChainState_(st.chainId);
+      continue;
+    }
+
+    if (!st.currentEventId) {
+      deleteHourlyChainState_(st.chainId);
+      continue;
+    }
+
+    const currentBlock = st.blocks[st.indexCurrent];
+    const exists = findEventById_(cal, addHours_(now, -48), addHours_(now, 48), st.currentEventId, { allowAllDay: false });
+
+    if (!exists) {
+      deleteHourlyChainState_(st.chainId);
+      continue;
+    }
+
+    const currentStart = new Date(currentBlock.start);
+    if (now.getTime() < currentStart.getTime()) {
+      saveHourlyChainState_(st);
+      continue;
+    }
+
+    // Если есть следующий блок — создаём его
+    if (st.indexCurrent < st.blocks.length - 1) {
+      const nextIndex = st.indexCurrent + 1;
+      const nextBlock = st.blocks[nextIndex];
+      const nextEventId = createHourlyBlockEvent_(st, st.chainId, nextIndex, nextBlock);
+
+      st.pendingDeleteEventId = st.currentEventId;
+      st.currentEventId = nextEventId;
+      st.indexCurrent = nextIndex;
+      saveHourlyChainState_(st);
+      continue;
+    }
+
+    // Последний блок: создаём финальное событие №3
+    const finalEventId = createFinalEvent_(st);
+    if (finalEventId) {
+      st.pendingDeleteEventId = st.currentEventId;
+      st.currentEventId = "";
+      st.status = "final_cleanup";
+      saveHourlyChainState_(st);
+    } else {
+      deleteHourlyChainState_(st.chainId);
+    }
+  }
+}
+
+function buildHourlySignals_(longStart, expiresAt) {
+  const endSignal = addHours_(expiresAt, -1);
+  const firstRaw = addHours_(longStart, 1);
+  let t = ceilToHour_(firstRaw);
+
+  const signals = [];
+  while (t.getTime() <= endSignal.getTime()) {
+    if (!isInQuietHours_(t)) signals.push(new Date(t));
+    t = addHours_(t, CONFIG.HOURLY_INTERVAL_HOURS);
+  }
+
+  if (!isInQuietHours_(endSignal)) {
+    if (!signals.length || signals[signals.length - 1].getTime() !== endSignal.getTime()) {
+      signals.push(endSignal);
+    }
+  }
+
+  return signals;
+}
+
+function buildHourlyBlocks_(signals) {
+  const blocks = [];
+  const step = CONFIG.HOURLY_BLOCK_MAX_SIGNALS;
+
+  for (let i = 0; i < signals.length; i += step) {
+    const slice = signals.slice(i, i + step);
+    if (!slice.length) continue;
+    const start = slice[slice.length - 1];
+    const reminders = [];
+    for (let j = 0; j < slice.length; j++) {
+      const diffMin = Math.round((start.getTime() - slice[j].getTime()) / 60000);
+      reminders.push(diffMin);
+    }
+    blocks.push({
+      start: start.toISOString(),
+      reminders
+    });
+  }
+
+  return blocks;
+}
+
+function createHourlyBlockEvent_(mailOrState, chainId, index, block) {
+  const cal = CalendarApp.getDefaultCalendar();
+  const start = new Date(block.start);
+  const end = addMinutes_(start, 5);
+  const eventId = chainId + "|B" + index + "|" + formatYYYYMMDDHHMM_(start);
+  const mode = mailOrState.mode || "LIVE";
+  const subject = mailOrState.subject || "";
+  const threadId = mailOrState.threadId || "";
+  const gmailLink = mailOrState.gmailLink || "";
+  const meta = mailOrState.meta || {};
+
+  const title = "[" + CONFIG.EVENT_PREFIX + "][" + mode + "] 🔔 Часовые";
+  const desc = buildDescriptionNew_({
+    id: eventId,
+    mode,
+    kind: "HOURLY",
+    expectedSender: CONFIG.EXPECTED_SENDER_EMAIL,
+    inbox: CONFIG.YOUR_INBOX_EMAIL,
+    subject,
+    receivedAt: mailOrState.receivedAt ? new Date(mailOrState.receivedAt) : "",
+    expiresAt: mailOrState.expiresAt ? new Date(mailOrState.expiresAt) : "",
+    gmailLink,
+    threadId,
+    reminders: block.reminders.join(", "),
+    meta: Object.assign({}, meta, { chainId, blockIndex: index })
+  });
+
+  const ev = cal.createEvent(title, start, end, { description: desc });
+  ev.removeAllReminders();
+  for (let i = 0; i < block.reminders.length; i++) {
+    ev.addPopupReminder(block.reminders[i]);
+  }
+  return eventId;
+}
+
+function createFinalEvent_(state) {
+  const cal = CalendarApp.getDefaultCalendar();
+  const endAt = new Date(state.expiresAt);
+  const start = endAt;
+  const end = addMinutes_(start, 5);
+  const eventId = state.chainId + "|FINAL|" + formatYYYYMMDDHHMM_(start);
+
+  const title = "[" + CONFIG.EVENT_PREFIX + "][" + state.mode + "] ❗ Финал";
+  const desc = buildDescriptionNew_({
+    id: eventId,
+    mode: state.mode,
+    kind: "FINAL",
+    expectedSender: CONFIG.EXPECTED_SENDER_EMAIL,
+    inbox: CONFIG.YOUR_INBOX_EMAIL,
+    subject: state.subject,
+    receivedAt: state.receivedAt ? new Date(state.receivedAt) : "",
+    expiresAt: endAt,
+    gmailLink: state.gmailLink || "",
+    threadId: state.threadId || "",
+    reminders: CONFIG.FINAL_REMINDERS_MINUTES.join(", "),
+    meta: Object.assign({}, state.meta || {}, { chainId: state.chainId })
+  });
+
+  const ev = cal.createEvent(title, start, end, { description: desc });
+  ev.removeAllReminders();
+  for (let i = 0; i < CONFIG.FINAL_REMINDERS_MINUTES.length; i++) {
+    ev.addPopupReminder(CONFIG.FINAL_REMINDERS_MINUTES[i]);
+  }
+  return eventId;
+}
+
+function ensureHourlyChainTrigger_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let has = false;
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "processHourlyChains_") {
+      has = true;
+      break;
+    }
+  }
+  if (has) return;
+
+  ScriptApp.newTrigger("processHourlyChains_")
+    .timeBased()
+    .everyHours(1)
+    .create();
+}
+
+function cleanupHourlyChainTrigger_() {
+  const chains = listHourlyChainStates_();
+  if (chains.length) return;
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "processHourlyChains_") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
+
+function saveHourlyChainState_(state) {
+  PropertiesService.getScriptProperties().setProperty("MAILALERT_HCHAIN:" + state.chainId, JSON.stringify(state));
+}
+
+function getHourlyChainState_(chainId) {
+  const raw = PropertiesService.getScriptProperties().getProperty("MAILALERT_HCHAIN:" + chainId);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function deleteHourlyChainState_(chainId) {
+  PropertiesService.getScriptProperties().deleteProperty("MAILALERT_HCHAIN:" + chainId);
+}
+
+function listHourlyChainStates_() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const keys = Object.keys(props).filter(k => k.indexOf("MAILALERT_HCHAIN:") === 0);
+  const out = [];
+  for (let i = 0; i < keys.length; i++) {
+    try { out.push(JSON.parse(props[keys[i]])); } catch (e) {}
+  }
+  return out;
+}
+
 /***********************
  * DATE HELPERS
  ***********************/
@@ -770,9 +1089,28 @@ function addDays_(dt, days) {
   return d;
 }
 
+function addHours_(dt, hours) {
+  return addMinutes_(dt, hours * 60);
+}
+
+function addMinutes_(dt, minutes) {
+  const d = new Date(dt.getTime());
+  d.setMinutes(d.getMinutes() + minutes);
+  return d;
+}
+
 function truncate_(s, n) {
   if (!s) return "";
   return s.length <= n ? s : s.slice(0, n - 1) + "…";
+}
+
+function formatYYYYMMDDHHMM_(dt) {
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const d = String(dt.getDate()).padStart(2, "0");
+  const hh = String(dt.getHours()).padStart(2, "0");
+  const mm = String(dt.getMinutes()).padStart(2, "0");
+  return `${y}${m}${d}${hh}${mm}`;
 }
 
 /***********************

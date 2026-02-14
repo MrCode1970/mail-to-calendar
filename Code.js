@@ -1,17 +1,16 @@
 /*************************************************************
- * PROJECT: Mail → Calendar V3
+ * PROJECT: Mail → Calendar V3.01
  *
  * Цель:
  *  - ждать письмо от queue-mailer@kdmid.ru (действительно 24 часа)
  *  - создать в Google Calendar события, чтобы сложно было пропустить уведомления
  *
- * Модель: 4 вида событий
- *  1) ALLDAY (сегодня) — визуальный якорь “как ДР”
- *  2) LONG (сутки) — старт now+10мин, конец receivedAt+24ч,
+ * Модель: 3 вида событий
+ *  1) LONG (сутки) — старт now+10мин, конец receivedAt+24ч,
  *     напоминания за 8/6/4/2 минут и в момент старта
- *  3) HOURLY-CHAIN — часовые сигналы вне тихого времени
+ *  2) HOURLY-CHAIN — часовые сигналы вне тихого времени
  *     (создаётся/проверяется цепочкой, прекращается при удалении)
- *  4) FINAL — финальное событие перед дедлайном
+ *  3) FINAL — финальное событие перед дедлайном
  *
  * Режимы:
  *  - LIVE: берём новые письма from:sender -label:processed newer_than:2d
@@ -36,8 +35,8 @@ const CONFIG = {
   // Для LIVE: помечаем обработанные треды ярлыком
   PROCESSED_LABEL_NAME: "MailAlertProcessed",
 
-  // Префикс заголовков событий
-  EVENT_PREFIX: "MAIL ALERT",
+  // Для отдельного потока TASKS: не конфликтует с календарным ярлыком
+  PROCESSED_TASK_LABEL_NAME: "MailAlertTaskProcessed",
 
   // “Письмо действительно” (часов)
   ACTIVE_WINDOW_HOURS: 24,
@@ -77,6 +76,9 @@ const CONFIG = {
 
   // В LIVE: период поиска новых писем
   LIVE_NEWER_THAN_DAYS: 2,
+
+  // Google Tasks
+  TASKS_TASKLIST_ID: "@default",
 };
 
 /***********************
@@ -118,7 +120,8 @@ function checkMailAndCreateTwoEvents() {
           realMailReceivedAt: latest ? latest.realReceivedAt.toString() : "",
           realMailMessageId: latest ? latest.messageId : "",
           lookbackDays: CONFIG.TEST_LOOKBACK_DAYS,
-          note: "TEST: контекст реального письма, но receivedAt=NOW"
+          note: "TEST: контекст реального письма, но receivedAt=NOW",
+          gmailMessageLink: latest ? latest.gmailMessageLink : ""
         }
       };
 
@@ -237,8 +240,21 @@ function setupLogSheetUi() {
 function runTestOnce() {
   const saved = CONFIG.TEST_MODE;
   CONFIG.TEST_MODE = true;
-  checkMailAndCreateTwoEvents();
-  CONFIG.TEST_MODE = saved;
+  try {
+    checkMailAndCreateTwoEvents();
+  } finally {
+    CONFIG.TEST_MODE = saved;
+  }
+}
+
+function runTaskTestOnce() {
+  const saved = CONFIG.TEST_MODE;
+  CONFIG.TEST_MODE = true;
+  try {
+    checkMailAndCreateTaskOnce();
+  } finally {
+    CONFIG.TEST_MODE = saved;
+  }
 }
 
 /***********************
@@ -247,7 +263,8 @@ function runTestOnce() {
 
 /**
  * Удаляет НОВЫЕ тестовые события (созданные ЭТОЙ версией кода)
- * по строке "MAILALERT_MODE: TEST".
+ * по строке "MAILALERT_ID: TEST|...".
+ * Также очищает TEST-состояния HOURLY-CHAIN из ScriptProperties.
  */
 function deleteAllTestAlerts() {
   const runId = newRunId_();
@@ -258,24 +275,26 @@ function deleteAllTestAlerts() {
   const to   = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000);
 
   const events = cal.getEvents(from, to);
+  const scriptProps = PropertiesService.getScriptProperties();
+  const allProps = scriptProps.getProperties();
 
   let scanned = 0;
   let matched = 0;
   let deleted = 0;
+  let chainStatesDeleted = 0;
 
   for (let i = 0; i < events.length; i++) {
     scanned++;
     const ev = events[i];
     const desc = ev.getDescription() || "";
-    if (desc.indexOf("MAILALERT_MODE: TEST") === -1) continue;
+    if (desc.indexOf("MAILALERT_ID: TEST|") === -1) continue;
 
     matched++;
     const title = ev.getTitle();
     const id = extractLineValue_(desc, "MAILALERT_ID");
-    const kind = extractLineValue_(desc, "MAILALERT_KIND");
 
     slogVerbose_(runId, "DEL_TEST_MATCH", "Удаляем TEST событие", {
-      title, kind, id,
+      title, id,
       start: ev.getStartTime().toString(),
       allDay: safeIsAllDay_(ev)
     });
@@ -284,56 +303,234 @@ function deleteAllTestAlerts() {
     deleted++;
   }
 
-  slogOk_(runId, "DEL_TEST_DONE", "Удаление TEST (NEW FORMAT) завершено", { scanned, matched, deleted });
-  sheetLog_(runId, "TEST", "DELETED", "Удалены TEST события (NEW FORMAT)", { scanned, matched, deleted });
+  const propKeys = Object.keys(allProps);
+  for (let i = 0; i < propKeys.length; i++) {
+    const key = propKeys[i];
+    if (key.indexOf("MAILALERT_HCHAIN:TEST|") !== 0) continue;
+    scriptProps.deleteProperty(key);
+    chainStatesDeleted++;
+  }
+
+  // Снимаем служебный триггер, если после очистки цепочек состояний не осталось.
+  cleanupHourlyChainTrigger_();
+
+  const result = { scanned, matched, deleted, chainStatesDeleted };
+  slogOk_(runId, "DEL_TEST_DONE", "Удаление TEST (NEW FORMAT) завершено", result);
+  sheetLog_(runId, "TEST", "DELETED", "Удалены TEST события (NEW FORMAT)", result);
 }
 
-/**
- * Удаляет СТАРЫЕ тестовые события (LEGACY), которые у тебя сейчас в календаре,
- * по строке "Mode: TEST" и "Expected sender: ...".
- *
- * Это нужно один раз, чтобы вычистить старые события, созданные прошлым кодом.
- */
-function deleteAllTestAlerts_Legacy() {
+/***********************
+ * TASKS (EXPERIMENT)
+ ***********************/
+function checkMailAndCreateTaskOnce() {
   const runId = newRunId_();
-  slogInfo_(runId, "DEL_LEGACY_START", "Удаление TEST-событий (LEGACY FORMAT: Mode: TEST)", {});
+  const lock = LockService.getScriptLock();
+  const lockAcquired = lock.tryLock(5000);
 
-  const cal = CalendarApp.getDefaultCalendar();
-  const from = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
-  const to   = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000);
-
-  const events = cal.getEvents(from, to);
-
-  let scanned = 0;
-  let matched = 0;
-  let deleted = 0;
-
-  for (let i = 0; i < events.length; i++) {
-    scanned++;
-    const ev = events[i];
-    const desc = ev.getDescription() || "";
-
-    // Твой старый формат:
-    // Mode: TEST
-    // Expected sender: queue-mailer@kdmid.ru
-    if (desc.indexOf("\nMode: TEST\n") === -1) continue;
-    if (desc.indexOf("\nExpected sender: " + CONFIG.EXPECTED_SENDER_EMAIL + "\n") === -1) continue;
-
-    matched++;
-    const title = ev.getTitle();
-
-    slogVerbose_(runId, "DEL_LEGACY_MATCH", "Удаляем legacy TEST событие", {
-      title,
-      start: ev.getStartTime().toString(),
-      allDay: safeIsAllDay_(ev)
-    });
-
-    ev.deleteEvent();
-    deleted++;
+  if (!lockAcquired) {
+    slogErr_(runId, "TASK_LOCK_BUSY", "Пропуск запуска TASK: предыдущий запуск ещё выполняется", {});
+    sheetLog_(runId, CONFIG.TEST_MODE ? "TEST" : "LIVE", "TASK_LOCK_BUSY", "Пропуск TASK: активен предыдущий запуск", {});
+    return;
   }
 
-  slogOk_(runId, "DEL_LEGACY_DONE", "Удаление TEST (LEGACY FORMAT) завершено", { scanned, matched, deleted });
-  sheetLog_(runId, "TEST", "DELETED", "Удалены TEST события (LEGACY FORMAT)", { scanned, matched, deleted });
+  slogInfo_(runId, "TASK_START", "Запуск создания Google Task", {
+    testMode: CONFIG.TEST_MODE,
+    expectedSender: CONFIG.EXPECTED_SENDER_EMAIL,
+    tasklistId: CONFIG.TASKS_TASKLIST_ID
+  });
+
+  try {
+    ensureTasksServiceEnabled_();
+
+    if (CONFIG.TEST_MODE) {
+      const latest = findLatestMailFromSender_(runId, CONFIG.EXPECTED_SENDER_EMAIL, CONFIG.TEST_LOOKBACK_DAYS);
+      const now = new Date();
+
+      const mail = {
+        mode: "TEST",
+        receivedAt: now,
+        subject: latest ? latest.subject : "TEST: не найдено писем — симуляция",
+        threadId: latest ? latest.threadId : "TEST_THREAD_NOW",
+        gmailLink: latest ? latest.gmailLink : "https://mail.google.com/mail/u/0/#inbox",
+        meta: {
+          test_used_latest_real_mail: Boolean(latest),
+          realMailReceivedAt: latest ? latest.realReceivedAt.toString() : "",
+          realMailMessageId: latest ? latest.messageId : "",
+          lookbackDays: CONFIG.TEST_LOOKBACK_DAYS,
+          note: "TEST TASK: контекст реального письма, но receivedAt=NOW",
+          gmailMessageLink: latest ? latest.gmailMessageLink : ""
+        }
+      };
+
+      const res = createTaskForMail_(runId, mail);
+      slogOk_(runId, "TASK_DONE_TEST", "TEST: создание Google Task завершено", res);
+      sheetLog_(runId, "TEST", "TASK_DONE", "TEST: обработка Google Task завершена", res);
+      return;
+    }
+
+    // LIVE (отдельный поток): берём только самое свежее необработанное письмо
+    const label = getOrCreateGmailLabel_(CONFIG.PROCESSED_TASK_LABEL_NAME);
+    const query =
+      "from:" + CONFIG.EXPECTED_SENDER_EMAIL +
+      " newer_than:" + CONFIG.LIVE_NEWER_THAN_DAYS + "d" +
+      " -label:" + CONFIG.PROCESSED_TASK_LABEL_NAME;
+
+    slogInfo_(runId, "TASK_GMAIL_QUERY", "LIVE TASK: поиск в Gmail", { query });
+
+    const threads = GmailApp.search(query, 0, 20);
+    if (!threads || threads.length === 0) {
+      slogOk_(runId, "TASK_NO_MAIL", "LIVE TASK: писем не найдено", {});
+      sheetLog_(runId, "LIVE", "TASK_NO_MAIL", "LIVE TASK: писем не найдено", {});
+      return;
+    }
+
+    let latestThread = null;
+    let latestMessage = null;
+    let latestDate = 0;
+
+    for (let i = 0; i < threads.length; i++) {
+      const t = threads[i];
+      const msgs = t.getMessages();
+      if (!msgs || !msgs.length) continue;
+      const m = msgs[msgs.length - 1];
+      const d = m.getDate().getTime();
+      if (d > latestDate) {
+        latestDate = d;
+        latestThread = t;
+        latestMessage = m;
+      }
+    }
+
+    if (!latestThread || !latestMessage) {
+      slogOk_(runId, "TASK_NO_MAIL", "LIVE TASK: не удалось выбрать письмо", {});
+      sheetLog_(runId, "LIVE", "TASK_NO_MAIL", "LIVE TASK: не удалось выбрать письмо", {});
+      return;
+    }
+
+    const threadId = latestThread.getId();
+    const mail = {
+      mode: "LIVE",
+      receivedAt: latestMessage.getDate(),
+      subject: latestMessage.getSubject(),
+      threadId,
+      gmailLink: buildGmailThreadLink_(threadId),
+      meta: { gmailMessageLink: buildGmailMessageLink_(latestMessage) }
+    };
+
+    const res = createTaskForMail_(runId, mail);
+    latestThread.addLabel(label);
+
+    slogOk_(runId, "TASK_DONE_LIVE", "LIVE TASK: создание Google Task завершено", res);
+    sheetLog_(runId, "LIVE", "TASK_DONE", "LIVE TASK: обработка Google Task завершена", res);
+  } catch (err) {
+    const payload = { error: String(err), stack: err && err.stack ? String(err.stack) : "" };
+    slogErr_(runId, "TASK_FATAL", "Фатальная ошибка в потоке TASK", payload);
+    sheetLog_(runId, CONFIG.TEST_MODE ? "TEST" : "LIVE", "TASK_ERR_FATAL", "Фатальная ошибка TASK", payload);
+    throw err;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function createTaskForMail_(runId, mail) {
+  ensureTasksServiceEnabled_();
+
+  const mode = mail.mode || "LIVE";
+  const receivedAt = new Date(mail.receivedAt);
+  const now = new Date();
+  const expiresAt = new Date(receivedAt.getTime() + CONFIG.ACTIVE_WINDOW_HOURS * 60 * 60 * 1000);
+  const baseId = buildBaseId_(mode, mail.threadId || "NO_THREAD", receivedAt, now);
+  const taskMarkerId = baseId + "|TASK";
+
+  const existing = findTaskByMarker_(CONFIG.TASKS_TASKLIST_ID, taskMarkerId);
+  if (existing) {
+    const out = { created: false, taskMarkerId, taskId: existing.id || "", taskTitle: existing.title || "" };
+    slogOk_(runId, "TASK_EXISTS", "Google Task уже существует (по marker)", out);
+    return out;
+  }
+
+  const title = buildTaskTitle_(mail, expiresAt, mode === "TEST");
+  const notes = buildTaskNotes_(mail, taskMarkerId, expiresAt);
+  const payload = {
+    title,
+    notes,
+    // Tasks API хранит только дату due (время отбрасывается сервером).
+    due: expiresAt.toISOString(),
+    status: "needsAction"
+  };
+
+  const created = Tasks.Tasks.insert(payload, CONFIG.TASKS_TASKLIST_ID);
+  const out = {
+    created: true,
+    taskMarkerId,
+    taskId: created && created.id ? created.id : "",
+    due: expiresAt.toISOString(),
+    title
+  };
+  slogOk_(runId, "TASK_CREATED", "Создан Google Task", out);
+  return out;
+}
+
+function ensureTasksServiceEnabled_() {
+  const ok = typeof Tasks !== "undefined" && Tasks && Tasks.Tasks && Tasks.Tasklists;
+  if (ok) return;
+  throw new Error(
+    "Advanced service Tasks не включен. В Apps Script: Services -> Add a service -> Tasks API. " +
+    "Для clasp также добавь dependencies.enabledAdvancedServices в appsscript.json."
+  );
+}
+
+function findTaskByMarker_(taskListId, markerId) {
+  let pageToken = "";
+  const markerLine = "MAILALERT_TASK_ID: " + markerId;
+
+  do {
+    const params = {
+      showCompleted: true,
+      showHidden: true,
+      maxResults: 100
+    };
+    if (pageToken) params.pageToken = pageToken;
+
+    const resp = Tasks.Tasks.list(taskListId, params);
+
+    const items = (resp && resp.items) ? resp.items : [];
+    for (let i = 0; i < items.length; i++) {
+      const t = items[i];
+      const notes = t && t.notes ? String(t.notes) : "";
+      if (notes.indexOf(markerLine) !== -1) return t;
+    }
+
+    pageToken = (resp && resp.nextPageToken) ? String(resp.nextPageToken) : "";
+  } while (pageToken);
+
+  return null;
+}
+
+function buildTaskTitle_(mail, expiresAt, isTest) {
+  const subject = truncate_(mail.subject || "(без темы)", 120);
+  let title = "Важное письмо: " + subject + " до " + formatDateTime_(expiresAt);
+  if (isTest) title += " (тест)";
+  return title;
+}
+
+function buildTaskNotes_(mail, taskMarkerId, expiresAt) {
+  const mode = mail.mode || "LIVE";
+  const receivedAt = mail.receivedAt ? new Date(mail.receivedAt) : null;
+
+  const lines = [];
+  lines.push("Задача создана из письма Gmail.");
+  if (receivedAt) lines.push("Письмо получено: " + formatDateTime_(receivedAt));
+  lines.push("Дедлайн: " + formatDateTime_(expiresAt));
+  lines.push("Тема: " + (mail.subject || "(без темы)"));
+  if (mail.gmailLink) lines.push("Письмо (тред): " + mail.gmailLink);
+
+  const messageLink = (mail.meta && mail.meta.gmailMessageLink) ? String(mail.meta.gmailMessageLink) : "";
+  if (messageLink) lines.push("Письмо (сообщение): " + messageLink);
+
+  lines.push("MAILALERT_TASK_ID: " + taskMarkerId);
+  lines.push("MAILALERT_MODE: " + mode);
+  return lines.join("\n");
 }
 
 /***********************
@@ -345,10 +542,6 @@ function createTwoEventsForMail_(runId, mail) {
   // В LIVE: время письма реальное, в TEST: now
   const receivedAt = mail.receivedAt;
   const expiresAt = new Date(receivedAt.getTime() + CONFIG.ACTIVE_WINDOW_HOURS * 60 * 60 * 1000);
-
-  // ALLDAY — на дате receivedAt
-  const todayStart = startOfDay_(receivedAt);
-  const tomorrowStart = addDays_(todayStart, 1);
 
   const now = new Date();
   const longStart = addMinutes_(now, CONFIG.EVENT1_START_PLUS_MINUTES);
@@ -372,46 +565,14 @@ function createTwoEventsForMail_(runId, mail) {
     meta: mail.meta || {}
   });
 
-  const subjectShort = truncate_(mail.subject || "(без темы)", 80);
-  const prefix = "[" + CONFIG.EVENT_PREFIX + "][" + mode + "]";
-
-  // -------------------------
-  // EVENT 1: ALLDAY
-  // -------------------------
-  const allDayId = baseId + "|ALLDAY";
-  const allDayTitle = prefix + " 📌 Сегодня: " + subjectShort;
-
-  const allDayDescription = buildDescriptionNew_({
-    id: allDayId,
-    mode,
-    kind: "ALLDAY",
-    expectedSender: CONFIG.EXPECTED_SENDER_EMAIL,
-    inbox: CONFIG.YOUR_INBOX_EMAIL,
-    subject: mail.subject || "",
-    receivedAt,
-    expiresAt,
-    gmailLink: mail.gmailLink || "",
-    threadId: mail.threadId || "",
-    meta: mail.meta || {}
-  });
-
-  // Ищем ALLDAY в диапазоне дня
-  const allDayExists = findEventById_(cal, todayStart, tomorrowStart, allDayId, { allowAllDay: true });
-
-  if (allDayExists) {
-    slogOk_(runId, "ALLDAY_EXISTS", "ALLDAY уже есть (по ID)", { title: allDayExists.getTitle(), id: allDayId });
-  } else {
-    const ev = cal.createAllDayEvent(allDayTitle, todayStart, { description: allDayDescription });
-    ev.removeAllReminders();
-    ev.addPopupReminder(0); // 00:00 этого дня
-    slogOk_(runId, "ALLDAY_CREATED", "Создан ALLDAY", { title: allDayTitle, id: allDayId });
-  }
+  const subjectShort = truncate_(mail.subject || "(без темы)", 120);
+  const isTest = mode === "TEST";
 
   // -------------------------
   // EVENT 2: LONG (24h)
   // -------------------------
   const longId = baseId + "|LONG";
-  const longTitle = prefix + " 🔔 Сутки: " + truncate_(mail.subject || "(без темы)", 55);
+  const longTitle = buildEventTitle_("LONG", subjectShort, receivedAt, expiresAt, isTest);
 
   const longDescription = buildDescriptionNew_({
     id: longId,
@@ -424,8 +585,8 @@ function createTwoEventsForMail_(runId, mail) {
     expiresAt,
     gmailLink: mail.gmailLink || "",
     threadId: mail.threadId || "",
-    reminders: CONFIG.EVENT1_REMINDERS_MINUTES.join(", "),
-    meta: Object.assign({}, mail.meta || {}, { longStart: longStart.toISOString() })
+    eventStart: longStart,
+    meta: mail.meta || {}
   });
 
   const longExists = findEventById_(cal, addMinutes_(longStart, -60), addMinutes_(expiresAt, 60), longId, { allowAllDay: false });
@@ -451,9 +612,8 @@ function createTwoEventsForMail_(runId, mail) {
   // -------------------------
   startHourlyChainForMail_(runId, mail, baseId, longStart, expiresAt);
 
-  sheetLog_(runId, mode, "ALERTS_CREATED", "Созданы: ALLDAY + LONG + CHAIN", {
+  sheetLog_(runId, mode, "ALERTS_CREATED", "Созданы: LONG + CHAIN", {
     baseId,
-    allDayId,
     longId,
     receivedAt: receivedAt.toISOString(),
     longStart: longStart.toISOString(),
@@ -562,17 +722,6 @@ function isInQuietHours_(dt) {
   return (h >= CONFIG.QUIET_HOUR_START) || (h < CONFIG.QUIET_HOUR_END);
 }
 
-function nextQuietEndToMorning_(dt) {
-  const h = dt.getHours();
-  const res = new Date(dt.getTime());
-
-  if (h >= CONFIG.QUIET_HOUR_START) {
-    res.setDate(res.getDate() + 1);
-  }
-  res.setHours(CONFIG.QUIET_SET_TO_HOUR, 0, 0, 0);
-  return res;
-}
-
 /***********************
  * ID BUILDING
  ***********************/
@@ -598,36 +747,44 @@ function buildBaseId_(mode, threadId, receivedAt, now) {
  * DESCRIPTION (NEW FORMAT)
  ***********************/
 function buildDescriptionNew_(p) {
-  let metaBlock = "";
-  try {
-    const meta = p.meta || {};
-    metaBlock = Object.keys(meta).length ? ("\nMETA:\n" + JSON.stringify(meta, null, 2) + "\n") : "";
-  } catch (e) {
-    metaBlock = "";
+  const subject = p.subject || "(без темы)";
+  const receivedAt = p.receivedAt ? new Date(p.receivedAt) : null;
+  const expiresAt = p.expiresAt ? new Date(p.expiresAt) : null;
+  const eventStart = p.eventStart ? new Date(p.eventStart) : null;
+
+  let lines = [];
+
+  if (p.kind === "LONG") {
+    lines.push("Событие активно:");
+    if (eventStart) lines.push("с " + formatDateTime_(eventStart));
+    if (expiresAt) lines.push("по " + formatDateTime_(expiresAt));
+  } else if (p.kind === "HOURLY") {
+    lines.push("Почасовые напоминания.");
+    if (expiresAt && eventStart) {
+      lines.push("Осталось до дедлайна: " + formatDuration_(eventStart, expiresAt));
+    }
+  } else if (p.kind === "FINAL") {
+    lines.push("Финальные уведомления.");
+    if (expiresAt && eventStart) {
+      lines.push("Осталось до дедлайна: " + formatDuration_(eventStart, expiresAt));
+    }
   }
 
-  const messageLink = (p.meta && p.meta.gmailMessageLink) ? String(p.meta.gmailMessageLink) : "";
-  const openMailBlock = messageLink
-    ? ("\nOpen mail (thread):\n" + (p.gmailLink || "") + "\n\n" +
-       "Open mail (message):\n" + messageLink + "\n\n")
-    : ("\nOpen mail:\n" + (p.gmailLink || "") + "\n\n");
+  if (receivedAt) lines.push("Письмо получено: " + formatDateTime_(receivedAt));
+  lines.push("Тема: " + subject);
 
-  return (
-    "MAILALERT_ID: " + p.id + "\n" +
-    "MAILALERT_MODE: " + p.mode + "\n" +
-    "MAILALERT_KIND: " + p.kind + "\n" +
-    "Expected sender: " + (p.expectedSender || "") + "\n" +
-    "Inbox: " + (p.inbox || "") + "\n" +
-    "ThreadId: " + (p.threadId || "") + "\n" +
-    "Subject: " + (p.subject || "") + "\n" +
-    "ReceivedAt: " + (p.receivedAt ? p.receivedAt.toString() : "") + "\n" +
-    "ExpiresAt: " + (p.expiresAt ? p.expiresAt.toString() : "") + "\n" +
-    (p.tailStart ? ("TailStart: " + p.tailStart + "\n") : "") +
-    (p.reminders ? ("Reminders (min): " + p.reminders + "\n") : "") +
-    metaBlock +
-    openMailBlock +
-    "Удалишь событие — значит письмо обработано."
-  );
+  const messageLink = (p.meta && p.meta.gmailMessageLink) ? String(p.meta.gmailMessageLink) : "";
+  if (p.gmailLink) {
+    lines.push("Письмо (тред): " + p.gmailLink);
+  }
+  if (messageLink) {
+    lines.push("Письмо (сообщение): " + messageLink);
+  }
+
+  // Служебный идентификатор для поиска и удаления
+  lines.push("MAILALERT_ID: " + p.id);
+
+  return lines.join("\n");
 }
 
 /***********************
@@ -914,6 +1071,9 @@ function processHourlyChains_() {
       deleteHourlyChainState_(st.chainId);
     }
   }
+
+  // Удаляем триггер в этом же прогоне, если после обработки цепочек не осталось.
+  cleanupHourlyChainTrigger_();
 }
 
 function buildHourlySignals_(longStart, expiresAt) {
@@ -969,7 +1129,7 @@ function createHourlyBlockEvent_(mailOrState, chainId, index, block) {
   const gmailLink = mailOrState.gmailLink || "";
   const meta = mailOrState.meta || {};
 
-  const title = "[" + CONFIG.EVENT_PREFIX + "][" + mode + "] 🔔 Часовые";
+  const title = buildEventTitle_("HOURLY", truncate_(subject || "(без темы)", 120), new Date(mailOrState.receivedAt), new Date(mailOrState.expiresAt), mode === "TEST");
   const desc = buildDescriptionNew_({
     id: eventId,
     mode,
@@ -981,7 +1141,7 @@ function createHourlyBlockEvent_(mailOrState, chainId, index, block) {
     expiresAt: mailOrState.expiresAt ? new Date(mailOrState.expiresAt) : "",
     gmailLink,
     threadId,
-    reminders: block.reminders.join(", "),
+    eventStart: start,
     meta: Object.assign({}, meta, { chainId, blockIndex: index })
   });
 
@@ -1000,7 +1160,7 @@ function createFinalEvent_(state) {
   const end = addMinutes_(start, 5);
   const eventId = state.chainId + "|FINAL|" + formatYYYYMMDDHHMM_(start);
 
-  const title = "[" + CONFIG.EVENT_PREFIX + "][" + state.mode + "] ❗ Финал";
+  const title = "❗❗❗ " + buildEventTitle_("FINAL", truncate_(state.subject || "(без темы)", 120), new Date(state.receivedAt), endAt, state.mode === "TEST");
   const desc = buildDescriptionNew_({
     id: eventId,
     mode: state.mode,
@@ -1012,7 +1172,7 @@ function createFinalEvent_(state) {
     expiresAt: endAt,
     gmailLink: state.gmailLink || "",
     threadId: state.threadId || "",
-    reminders: CONFIG.FINAL_REMINDERS_MINUTES.join(", "),
+    eventStart: start,
     meta: Object.assign({}, state.meta || {}, { chainId: state.chainId })
   });
 
@@ -1079,16 +1239,6 @@ function listHourlyChainStates_() {
 /***********************
  * DATE HELPERS
  ***********************/
-function startOfDay_(dt) {
-  return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate(), 0, 0, 0);
-}
-
-function addDays_(dt, days) {
-  const d = new Date(dt.getTime());
-  d.setDate(d.getDate() + days);
-  return d;
-}
-
 function addHours_(dt, hours) {
   return addMinutes_(dt, hours * 60);
 }
@@ -1102,6 +1252,33 @@ function addMinutes_(dt, minutes) {
 function truncate_(s, n) {
   if (!s) return "";
   return s.length <= n ? s : s.slice(0, n - 1) + "…";
+}
+
+function formatDateTime_(dt) {
+  if (!dt) return "";
+  return Utilities.formatDate(dt, Session.getScriptTimeZone(), "dd.MM.yyyy HH:mm");
+}
+
+function formatDuration_(fromDt, toDt) {
+  const ms = Math.max(0, toDt.getTime() - fromDt.getTime());
+  const totalMin = Math.round(ms / 60000);
+  const hh = Math.floor(totalMin / 60);
+  const mm = totalMin % 60;
+  if (hh <= 0) return mm + " мин";
+  if (mm === 0) return hh + " ч";
+  return hh + " ч " + mm + " мин";
+}
+
+function buildEventTitle_(kind, subject, receivedAt, expiresAt, isTest) {
+  const subj = subject || "(без темы)";
+  let title = "Важное письмо! - " + subj + ". ";
+  if (kind === "LONG") {
+    title += "Получено " + formatDateTime_(receivedAt);
+  } else {
+    title += "Событие до " + formatDateTime_(expiresAt);
+  }
+  if (isTest) title += " (тест)";
+  return title;
 }
 
 function formatYYYYMMDDHHMM_(dt) {

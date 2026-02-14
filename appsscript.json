@@ -1,5 +1,14 @@
 {
   "timeZone": "Asia/Jerusalem",
   "exceptionLogging": "STACKDRIVER",
+  "dependencies": {
+    "enabledAdvancedServices": [
+      {
+        "userSymbol": "Tasks",
+        "serviceId": "tasks",
+        "version": "v1"
+      }
+    ]
+  },
   "runtimeVersion": "V8"
 }

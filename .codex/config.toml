@@ -1,0 +1,11 @@
+personality = "friendly"
+model = "gpt-5.3-codex"
+model_reasoning_effort = "high"
+model_verbosity = "low"
+
+# Safe-by-default automation for daily work in this repo.
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+# Keep responses focused; enable web only when explicitly needed.
+# web_search = "disabled"

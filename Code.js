@@ -79,6 +79,7 @@ const CONFIG = {
 
   // Google Tasks
   TASKS_TASKLIST_ID: "@default",
+  TASKS_DUE_DAYS_AHEAD: 1,
 };
 
 /***********************
@@ -265,6 +266,7 @@ function runTaskTestOnce() {
  * Удаляет НОВЫЕ тестовые события (созданные ЭТОЙ версией кода)
  * по строке "MAILALERT_ID: TEST|...".
  * Также очищает TEST-состояния HOURLY-CHAIN из ScriptProperties.
+ * И удаляет TEST-задачи Google Tasks по marker в notes.
  */
 function deleteAllTestAlerts() {
   const runId = newRunId_();
@@ -282,6 +284,11 @@ function deleteAllTestAlerts() {
   let matched = 0;
   let deleted = 0;
   let chainStatesDeleted = 0;
+  let tasksScanned = 0;
+  let tasksMatched = 0;
+  let tasksDeleted = 0;
+  let tasksDeleteErrors = 0;
+  let tasksCleanupSkipped = false;
 
   for (let i = 0; i < events.length; i++) {
     scanned++;
@@ -314,7 +321,31 @@ function deleteAllTestAlerts() {
   // Снимаем служебный триггер, если после очистки цепочек состояний не осталось.
   cleanupHourlyChainTrigger_();
 
-  const result = { scanned, matched, deleted, chainStatesDeleted };
+  try {
+    ensureTasksServiceEnabled_();
+    const taskCleanup = deleteTasksByMarkerPrefix_(runId, "TEST|");
+    tasksScanned = taskCleanup.tasksScanned;
+    tasksMatched = taskCleanup.tasksMatched;
+    tasksDeleted = taskCleanup.tasksDeleted;
+    tasksDeleteErrors = taskCleanup.tasksDeleteErrors;
+  } catch (err) {
+    tasksCleanupSkipped = true;
+    slogErr_(runId, "DEL_TEST_TASKS_SKIP", "Пропуск удаления TEST задач", {
+      error: String(err)
+    });
+  }
+
+  const result = {
+    scanned,
+    matched,
+    deleted,
+    chainStatesDeleted,
+    tasksScanned,
+    tasksMatched,
+    tasksDeleted,
+    tasksDeleteErrors,
+    tasksCleanupSkipped
+  };
   slogOk_(runId, "DEL_TEST_DONE", "Удаление TEST (NEW FORMAT) завершено", result);
   sheetLog_(runId, "TEST", "DELETED", "Удалены TEST события (NEW FORMAT)", result);
 }
@@ -438,24 +469,42 @@ function createTaskForMail_(runId, mail) {
   const mode = mail.mode || "LIVE";
   const receivedAt = new Date(mail.receivedAt);
   const now = new Date();
-  const expiresAt = new Date(receivedAt.getTime() + CONFIG.ACTIVE_WINDOW_HOURS * 60 * 60 * 1000);
+  const dueIso = buildTaskDueIso_(CONFIG.TASKS_DUE_DAYS_AHEAD);
+  const dueDate = new Date(dueIso);
   const baseId = buildBaseId_(mode, mail.threadId || "NO_THREAD", receivedAt, now);
   const taskMarkerId = baseId + "|TASK";
 
   const existing = findTaskByMarker_(CONFIG.TASKS_TASKLIST_ID, taskMarkerId);
   if (existing) {
-    const out = { created: false, taskMarkerId, taskId: existing.id || "", taskTitle: existing.title || "" };
-    slogOk_(runId, "TASK_EXISTS", "Google Task уже существует (по marker)", out);
+    let dueUpdated = false;
+    const existingDueYmd = isoToYmd_(existing.due);
+    const targetDueYmd = isoToYmd_(dueIso);
+
+    if (existing.id && existingDueYmd !== targetDueYmd) {
+      Tasks.Tasks.patch({ due: dueIso }, CONFIG.TASKS_TASKLIST_ID, existing.id);
+      dueUpdated = true;
+    }
+
+    const out = {
+      created: false,
+      dueUpdated,
+      taskMarkerId,
+      taskId: existing.id || "",
+      taskTitle: existing.title || "",
+      existingDue: existing.due || "",
+      targetDue: dueIso
+    };
+    slogOk_(runId, dueUpdated ? "TASK_DUE_UPDATED" : "TASK_EXISTS", dueUpdated ? "Google Task найдена, дедлайн обновлён" : "Google Task уже существует (по marker)", out);
     return out;
   }
 
-  const title = buildTaskTitle_(mail, expiresAt, mode === "TEST");
-  const notes = buildTaskNotes_(mail, taskMarkerId, expiresAt);
+  const title = buildTaskTitle_(mail, dueDate, mode === "TEST");
+  const notes = buildTaskNotes_(mail, taskMarkerId, dueDate);
   const payload = {
     title,
     notes,
     // Tasks API хранит только дату due (время отбрасывается сервером).
-    due: expiresAt.toISOString(),
+    due: dueIso,
     status: "needsAction"
   };
 
@@ -464,7 +513,7 @@ function createTaskForMail_(runId, mail) {
     created: true,
     taskMarkerId,
     taskId: created && created.id ? created.id : "",
-    due: expiresAt.toISOString(),
+    due: dueIso,
     title
   };
   slogOk_(runId, "TASK_CREATED", "Создан Google Task", out);
@@ -507,21 +556,66 @@ function findTaskByMarker_(taskListId, markerId) {
   return null;
 }
 
-function buildTaskTitle_(mail, expiresAt, isTest) {
+function deleteTasksByMarkerPrefix_(runId, markerPrefix) {
+  let pageToken = "";
+  const markerLinePrefix = "MAILALERT_TASK_ID: " + markerPrefix;
+  let tasksScanned = 0;
+  let tasksMatched = 0;
+  let tasksDeleted = 0;
+  let tasksDeleteErrors = 0;
+
+  do {
+    const params = {
+      showCompleted: true,
+      showHidden: true,
+      maxResults: 100
+    };
+    if (pageToken) params.pageToken = pageToken;
+
+    const resp = Tasks.Tasks.list(CONFIG.TASKS_TASKLIST_ID, params);
+    const items = (resp && resp.items) ? resp.items : [];
+
+    for (let i = 0; i < items.length; i++) {
+      tasksScanned++;
+      const t = items[i];
+      const notes = t && t.notes ? String(t.notes) : "";
+      if (notes.indexOf(markerLinePrefix) === -1) continue;
+
+      tasksMatched++;
+      try {
+        Tasks.Tasks.remove(CONFIG.TASKS_TASKLIST_ID, t.id);
+        tasksDeleted++;
+      } catch (err) {
+        tasksDeleteErrors++;
+        slogErr_(runId, "DEL_TEST_TASK_ERR", "Не удалось удалить TEST задачу", {
+          taskId: t && t.id ? String(t.id) : "",
+          title: t && t.title ? String(t.title) : "",
+          error: String(err)
+        });
+      }
+    }
+
+    pageToken = (resp && resp.nextPageToken) ? String(resp.nextPageToken) : "";
+  } while (pageToken);
+
+  return { tasksScanned, tasksMatched, tasksDeleted, tasksDeleteErrors };
+}
+
+function buildTaskTitle_(mail, dueDate, isTest) {
   const subject = truncate_(mail.subject || "(без темы)", 120);
-  let title = "Важное письмо: " + subject + " до " + formatDateTime_(expiresAt);
+  let title = "Важное письмо: " + subject + " до " + formatDateOnly_(dueDate);
   if (isTest) title += " (тест)";
   return title;
 }
 
-function buildTaskNotes_(mail, taskMarkerId, expiresAt) {
+function buildTaskNotes_(mail, taskMarkerId, dueDate) {
   const mode = mail.mode || "LIVE";
   const receivedAt = mail.receivedAt ? new Date(mail.receivedAt) : null;
 
   const lines = [];
   lines.push("Задача создана из письма Gmail.");
   if (receivedAt) lines.push("Письмо получено: " + formatDateTime_(receivedAt));
-  lines.push("Дедлайн: " + formatDateTime_(expiresAt));
+  lines.push("Срок выполнения: " + formatDateOnly_(dueDate));
   lines.push("Тема: " + (mail.subject || "(без темы)"));
   if (mail.gmailLink) lines.push("Письмо (тред): " + mail.gmailLink);
 
@@ -531,6 +625,21 @@ function buildTaskNotes_(mail, taskMarkerId, expiresAt) {
   lines.push("MAILALERT_TASK_ID: " + taskMarkerId);
   lines.push("MAILALERT_MODE: " + mode);
   return lines.join("\n");
+}
+
+function buildTaskDueIso_(daysAhead) {
+  const ahead = typeof daysAhead === "number" ? Math.max(0, Math.floor(daysAhead)) : 1;
+  const dt = new Date();
+  dt.setDate(dt.getDate() + ahead);
+  const ymd = Utilities.formatDate(dt, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  return ymd + "T00:00:00.000Z";
+}
+
+function isoToYmd_(isoValue) {
+  if (!isoValue) return "";
+  const s = String(isoValue);
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : "";
 }
 
 /***********************
@@ -1257,6 +1366,11 @@ function truncate_(s, n) {
 function formatDateTime_(dt) {
   if (!dt) return "";
   return Utilities.formatDate(dt, Session.getScriptTimeZone(), "dd.MM.yyyy HH:mm");
+}
+
+function formatDateOnly_(dt) {
+  if (!dt) return "";
+  return Utilities.formatDate(dt, Session.getScriptTimeZone(), "dd.MM.yyyy");
 }
 
 function formatDuration_(fromDt, toDt) {
